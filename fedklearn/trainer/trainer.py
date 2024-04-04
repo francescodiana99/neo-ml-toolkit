@@ -558,7 +558,7 @@ class DebugTrainer(Trainer):
         n_samples = 0
 
         for x, y in loader:
-            x = x.to(self.device).type(torch.float32)
+            x = x.to(self.device)
             x.requires_grad = True
             y = y.to(self.device)
 
