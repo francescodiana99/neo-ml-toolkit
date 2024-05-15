@@ -2,12 +2,14 @@ import json
 import os
 import shutil
 import logging
+import time
+
 import requests
 import tarfile
 from sklearn.model_selection import train_test_split
 
 
-from .constants import *
+from fedklearn.datasets.purchase.constants import *
 import torch
 import pandas as pd
 from torch.utils.data import Dataset
@@ -15,7 +17,7 @@ from torch.utils.data import Dataset
 import numpy as np
 
 class FederatedPurchaseDataset:
-    """A class representing a federated dataset derived from the Adult dataset.
+    """A class representing a federated dataset derived from the Purchase dataset.
 
     This dataset is designed for federated learning scenarios where the data is split across multiple clients,
     and each client represents a specific task.
@@ -86,9 +88,9 @@ class FederatedPurchaseDataset:
 
             _preprocess(self): Preprocesses the raw data and saves it to the intermediate data directory.
 
-            _iid_train_divide(self, df): Divides the training data into tasks for training.
+            _iid_divide(self, df): Split a dataframe into a dictionary of dataframes.
 
-            _iid_test_divide(self, df): Divides the test data into tasks for testing.
+            iid_tasks_divide(self, df): Divides the data in training and test dictionaries.
 
             _random_tasks_split(self, df): Splits the data into tasks using random sampling.
 
@@ -109,6 +111,9 @@ class FederatedPurchaseDataset:
         self.split_criterion = split_criterion
         self.test_frac = test_frac
 
+        self.n_tasks = n_tasks
+        self.n_tasks_samples = n_task_samples
+
         self.raw_data_dir = os.path.join(self.cache_dir, "raw")
         self.intermediate_data_dir = os.path.join(self.cache_dir, "intermediate")
         self.tasks_folder = os.path.join(self.cache_dir, "tasks")
@@ -119,6 +124,11 @@ class FederatedPurchaseDataset:
         if os.path.exists(self.tasks_folder) and not self.force_generation:
             logging.info("Processed data folders found. Loading existing files..")
             self._load_task_mapping()
+
+        elif not self.download and self.force_generation:
+            logging.info("Data found in the cache directory. Splitting data into tasks..")
+            all_data = pd.read_csv(os.path.join(self.intermediate_data_dir, "dataset_purchase.csv"))
+            self._generate_tasks(all_data)
 
         elif  not self.download:
             raise RuntimeError(
@@ -137,38 +147,61 @@ class FederatedPurchaseDataset:
             os.makedirs(self.intermediate_data_dir, exist_ok=True)
 
             all_data = self._preprocess()
-            self.n_tasks = n_tasks
-            self.n_tasks_samples = n_task_samples
+            self._generate_tasks(all_data)
 
-            train_tasks_dict, test_tasks_dict = self._split_data_into_tasks(all_data)
-            task_dicts = [train_tasks_dict, test_tasks_dict]
 
-            self.task_id_to_name = {f"{i}": task_name for i, task_name in enumerate(train_tasks_dict.keys())}
+    def _generate_tasks(self, all_data):
+        """
+        Splits the data into tasks and saves the data to the tasks folder.
+        Args:
+            all_data(pd.DataFrame): a DataFrame containing the entire dataset.
 
-            for mode, task_dict in zip(['train', 'test'], task_dicts):
-                for task_name, task_data in task_dict.items():
-                    task_cache_dir = os.path.join(self.cache_dir, 'tasks', self.split_criterion, task_name)
-                    os.makedirs(task_cache_dir, exist_ok=True)
+        Returns:
+        """
 
-                    file_path = os.path.join(task_cache_dir, f'{mode}.csv')
-                    task_data.to_csv(file_path, index=False)
+        train_tasks_dict, test_tasks_dict = self._split_data_into_tasks(all_data)
+        task_dicts = [train_tasks_dict, test_tasks_dict]
 
-                    logging.debug(f"{mode.capitalize()} data for task '{task_name}' cached at: {file_path}")
+        self.task_id_to_name = {f"{i}": task_name for i, task_name in enumerate(train_tasks_dict.keys())}
 
-            self._save_task_mapping(self.task_id_to_name)
+        for mode, task_dict in zip(['train', 'test'], task_dicts):
+            for task_name, task_data in task_dict.items():
+                task_cache_dir = os.path.join(self.cache_dir, 'tasks', self.split_criterion, task_name)
+                os.makedirs(task_cache_dir, exist_ok=True)
 
-            self._save_split_criterion()
+                file_path = os.path.join(task_cache_dir, f'{mode}.csv')
+                task_data.to_csv(file_path, index=False)
+
+                logging.debug(f"{mode.capitalize()} data for task '{task_name}' cached at: {file_path}")
+
+        self._save_task_mapping(self.task_id_to_name)
+
+        self._save_split_criterion()
 
 
     def _save_split_criterion(self):
+        """
+        Saves the split criterion to a file.
+        Returns:
+
+        """
         with open(self._split_criterion_path, "w") as f:
             criterion_dict = {'split_criterion': self.split_criterion, 'n_tasks': self.n_tasks,
-                              'n_task_samples': self.n_tasks_samples}
+                              'n_task_samples': self.n_tasks_samples, 'test_frac': self.test_frac}
             json.dump(criterion_dict, f)
 
 
     @staticmethod
     def _download_file(url, file_path):
+        """
+        Downloads a file from a URL and saves it to a file path.
+        Args:
+            url(str): The URL of the file to download.
+            file_path(os.Path): The file path to save the downloaded file.
+
+        Returns:
+
+        """
         response = requests.get(url, stream=True)
         with open(file_path, "wb") as file:
             for chunk in response.iter_content(chunk_size=1024):
@@ -177,6 +210,15 @@ class FederatedPurchaseDataset:
 
     @staticmethod
     def _unzip_file(tgzfile_path, dest_dir):
+        """
+        Unzips a .tgz file to a destination directory.
+        Args:
+            tgzfile_path(str): The path to the .tgz file to unzip.
+            dest_dir(str): The destination directory to extract the files to.
+
+        Returns:
+
+        """
         try:
             with tarfile.open(tgzfile_path, "r:gz") as tar:
                 tar.extractall(dest_dir)
@@ -186,6 +228,9 @@ class FederatedPurchaseDataset:
 
 
     def _download_data(self):
+        """
+        Downloads the raw data and unzips it to the raw data directory.
+        """
         tgzfile_path = os.path.join(self.raw_data_dir, TGZ_FILENAME)
         self._download_file(URL, tgzfile_path)
         logging.info(f"Data downloaded to {tgzfile_path}.")
@@ -195,6 +240,13 @@ class FederatedPurchaseDataset:
 
 
     def _save_task_mapping(self, metadata_dict):
+        """
+        Saves the task mapping to the metadata file.
+        Args:
+            metadata_dict(dict): A dictionary mapping task IDs to task names.
+
+        Returns:
+        """
         if os.path.exists(self._metadata_path):
             with open(self._metadata_path, "r") as f:
                 metadata = json.load(f)
@@ -208,13 +260,20 @@ class FederatedPurchaseDataset:
 
 
     def _load_task_mapping(self):
+        """
+        Loads the task mapping from the metadata file.
+        Returns:
+
+        """
         with (open(self._metadata_path, "r") as f):
             metadata = json.load(f)
             self.task_id_to_name = metadata[self.split_criterion]
 
 
     def _preprocess(self):
-        """Rename the columns to item IDs and save the processed data to the intermediate data folder."""
+        """
+        Rename the columns to item IDs and save the processed data to the intermediate data folder.
+        """
         df = pd.read_csv(os.path.join(self.raw_data_dir, FILENAME))
         item_ids = [f"{i}" for i in range(len(df.columns) - 1)]
         new_columns = ["class"] + item_ids
@@ -224,51 +283,82 @@ class FederatedPurchaseDataset:
         return df
 
 
-    def _iid_train_divide(self, df):
-        task_dict = dict()
+    def _iid_tasks_divide(self, df):
+        """
+        Divides the data in training and test dictionaries in an iid fashion.
+        Args:
+            df(pd.DataFrame): The DataFrame containing the data to split.
+
+        Returns:
+            Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]: A tuple containing the training and test dictionaries.
+
+        """
+
         if self.test_frac is  None:
-            group_size = self.n_tasks_samples
-            for i in range(self.n_tasks):
-                task_dict[f"{i}"] = df.sample(n=group_size, random_state=self.rng)
-                df = df.drop(task_dict[f"{i}"].index)
+            train_size = self.n_tasks_samples * self.n_tasks
         else:
             train_size = int(len(df) / self.n_tasks * (1 - self.test_frac))
-            for i in range(self.n_tasks):
-                task_dict[f"{i}"] = df.sample(n=train_size, random_state=self.rng)
-                df = df.drop(task_dict[f"{i}"].index)
 
-        return task_dict, df
+        df_train = df.iloc[:train_size, :]
+        df_test = df.iloc[train_size:, :]
+        tasks_dict_train = self._iid_divide(df_train)
+        tasks_dict_test = self._iid_divide(df_test)
+
+        return tasks_dict_train, tasks_dict_test
 
 
-    def _iid_test_divide(self, df):
+    def _iid_divide(self, df):
+        """
+        Split a dataframe into a dictionary of dataframes.
+        Args:
+            df(pd.DataFrame): DataFrame to split into tasks.
+
+        Returns:
+            tasks_dict(Dict[str, pd.DataFrame]): A dictionary mapping task IDs to dataframes.
+
+        """
         num_elems = len(df)
         group_size = int(len(df) // self.n_tasks)
         num_big_groups = num_elems - self.n_tasks * group_size
         num_small_groups = self.n_tasks - num_big_groups
-        test_tasks_dict = dict()
+        tasks_dict = dict()
 
         for i in range(num_small_groups):
-            test_tasks_dict[f"{i}"] = df.iloc[group_size * i: group_size * (i + 1)]
+            tasks_dict[f"{i}"] = df.iloc[group_size * i: group_size * (i + 1)]
         bi = group_size * num_small_groups
         group_size += 1
         for i in range(num_big_groups):
-            test_tasks_dict[f"{i + num_small_groups}"] = df.iloc[bi + group_size * i:bi + group_size * (i + 1)]
+            tasks_dict[f"{i + num_small_groups}"] = df.iloc[bi + group_size * i:bi + group_size * (i + 1)]
 
-        return test_tasks_dict
+        return tasks_dict
 
 
     def _random_tasks_split(self, df):
+        """
+        Splits the data into tasks using random sampling.
+        Args:
+            df(pd.DataFrame): The DataFrame containing the data to split.
 
+        Returns:
+            Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]: A tuple containing the training and test dictionaries.
+
+        """
         shuffled_indices = self.rng.permutation(len(df))
         all_data = df.iloc[shuffled_indices]
-
-        train_tasks_dict, test_data = self._iid_train_divide(all_data)
-        test_tasks_dict = self._iid_test_divide(test_data)
-
+        train_tasks_dict, test_tasks_dict = self._iid_tasks_divide(all_data)
         return train_tasks_dict, test_tasks_dict
 
 
     def _class_tasks_split(self, df):
+        """
+        Splits the data into tasks using the class labels.
+        Args:
+            df(pd.DataFrame):  The DataFrame containing the data to split.
+
+        Returns:
+            Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]: A tuple containing the training and test dictionaries.
+
+        """
 
         assert df['class'].nunique() == self.n_tasks, "Number of tasks must be equal to the number of classes."
 
@@ -297,19 +387,26 @@ class FederatedPurchaseDataset:
         return train_tasks_dict, test_task_dict
 
     def _split_data_into_tasks(self, all_data):
+        """
+        Splits the data into tasks using a specified criterion. Available criteria are 'random' and 'class'.
+        Args:
+            all_data(pd.DataFrame): The DataFrame containing the data to split.
+
+        Returns:
+            Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]: A tuple containing the training and test dictionaries.
+        """
         if self.tasks_folder is not None:
             os.makedirs(self.tasks_folder, exist_ok=True)
         else:
             raise ValueError("Tasks folder is not defined.")
 
         if self.n_tasks_samples is not None and self.n_tasks * self.n_tasks_samples > len(all_data):
-            raise ValueError("Number of tasks times number of samples per task exceeds the number of available samples.")
+            raise ValueError("The product between 'n_tasks' and 'n_tasks_samples' exceeds the number of available samples.")
 
         if self.split_criterion == "random":
             train_tasks_dict, test_tasks_dict = self._random_tasks_split(all_data)
         elif self.split_criterion == "class":
             train_tasks_dict, test_tasks_dict = self._class_tasks_split(all_data)
-
         else:
             raise ValueError(f"Split criterion '{self.split_criterion}' is not recognized.")
 
@@ -317,6 +414,15 @@ class FederatedPurchaseDataset:
 
 
     def get_task_dataset(self, task_id, mode='train'):
+        """
+        Returns an instance of the `PurchaseDataset` class for a specific task and data split type.
+        Args:
+            task_id(str): The task number or name.
+            mode(str): The type of data split, either 'train' or 'test'. Default is 'train'
+
+        Returns:
+            PurchaseDataset: An instance of the `PurchaseDataset` class.
+        """
 
         task_id = str(task_id)
 
@@ -330,8 +436,215 @@ class FederatedPurchaseDataset:
 
         return PurchaseDataset(task_data, name=task_name)
 
+class FederatedPurchaseBinaryClassificationDataset(FederatedPurchaseDataset):
+    def __init__(self, cache_dir="./", download=True, rng=None, force_generation=True, n_tasks=4,
+                 n_task_samples=1000, split_criterion="random", test_frac=None, target_item=None,
+                 n_features=None, sensitive_attribute=None, feature_correlation_path=None):
+        """
+        Initializes a federated dataset for binary classification tasks.
+        Args:
+            cache_dir:
+            download:
+            rng:
+            force_generation:
+            n_tasks:
+            n_task_samples:
+            split_criterion:
+            test_frac:
+            target_item:
+            n_features:
+            sensitive_attribute:
+            feature_correlation_path:
+        """
+        self.target_item = target_item
+        self.sensitive_attribute = sensitive_attribute
+        self.n_features = n_features
+        self.feature_correlation_path = feature_correlation_path
+
+        super().__init__(cache_dir=cache_dir, download=download, rng=rng, force_generation=force_generation,
+                         n_tasks=n_tasks, n_task_samples=n_task_samples, split_criterion=split_criterion,
+                         test_frac=test_frac)
+
+
+    # TODO: implement in a structured way
+    def _preprocess_binary_classification(self, all_data):
+        """Preprocesses the data for binary classification tasks.
+        Args: all_data(pd.DataFrame): The DataFrame containing the entire dataset.
+
+        Returns: pd.DataFrame: A DataFrame containing the processed data."""
+
+        all_data.drop('class', axis=1, inplace=True)
+        if self.feature_correlation_path is None:
+            raise ValueError("Feature correlation path must be defined for binary classification tasks.")
+        with open(self.feature_correlation_path, 'r') as f:
+            all_correlations = json.load(f)
+
+        absolute_corr_dict = dict()
+
+        for k in all_correlations.keys():
+            all_abs_corr = [(abs(e[0]), e[1]) for e in all_correlations[k]]
+            absolute_corr_dict[k] = all_abs_corr
+
+        absolute_corr_dict[self.target_item].sort(reverse=False)
+        feature_to_use = absolute_corr_dict[self.target_item][-self.n_features:]
+        feature_to_use.append(absolute_corr_dict[self.target_item][0])
+
+        columns = [str(f[1]) for f in feature_to_use]
+        return all_data[columns]
+
+    def _generate_tasks(self, all_data):
+        """
+        Splits the data into tasks and saves the data to the tasks folder.
+        Args:
+            all_data(pd.DataFrame): a DataFrame containing the entire dataset.
+
+        Returns:
+        """
+        all_data = self._preprocess_binary_classification(all_data)
+
+        train_tasks_dict, test_tasks_dict = self._split_data_into_tasks(all_data)
+        task_dicts = [train_tasks_dict, test_tasks_dict]
+
+        self.task_id_to_name = {f"{i}": task_name for i, task_name in enumerate(train_tasks_dict.keys())}
+
+        for mode, task_dict in zip(['train', 'test'], task_dicts):
+            for task_name, task_data in task_dict.items():
+                task_cache_dir = os.path.join(self.cache_dir, 'tasks', self.split_criterion, task_name)
+                os.makedirs(task_cache_dir, exist_ok=True)
+
+                file_path = os.path.join(task_cache_dir, f'{mode}.csv')
+                task_data.to_csv(file_path, index=False)
+
+                logging.debug(f"{mode.capitalize()} data for task '{task_name}' cached at: {file_path}")
+
+        self._save_task_mapping(self.task_id_to_name)
+
+        self._save_split_criterion()
+
+    def _same_tasks_divide(self, df):
+        """
+        Split a dataframe into a dictionary of dataframes.
+        Args:
+            df(pd.DataFrame): DataFrame to split into tasks.
+
+        Returns:
+            tasks_dict(Dict[str, pd.DataFrame]): A dictionary mapping task IDs to dataframes.
+
+        """
+        num_elems = len(df)
+        group_size = int(len(df) // (self.n_tasks - 1))
+        num_big_groups = num_elems - ((self.n_tasks - 1) * group_size)
+        num_small_groups = self.n_tasks - 1 - num_big_groups
+        tasks_dict = dict()
+
+        for i in range(num_small_groups):
+            tasks_dict[f"{i}"] = df.iloc[group_size * i: group_size * (i + 1)]
+        bi = group_size * num_small_groups
+        group_size += 1
+        for i in range(num_big_groups):
+            tasks_dict[f"{i + num_small_groups}"] = df.iloc[bi + group_size * i:bi + group_size * (i + 1)]
+
+        return tasks_dict
+    def _corr_tasks_split(self, df):
+
+        """
+        Splits the data into tasks using the class labels and the sensitive attribute. If n_tasks is 2, splits the data
+        into two tasks based on the sensitive attribute, create one task with the same sensitive attribute and target
+        item and one task with different sensitive attribute and target item. If n_tasks > 2, one task will have different
+        sensitive attribute and target item and the rest will have the same sensitive attribute and target item.
+        Args:
+            df(pd.DataFrame): The DataFrame containing the data to split.
+
+        Returns (Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]):
+        A tuple containing the training and test dictionaries.
+
+        """
+
+        train_tasks_dict = dict()
+        test_tasks_dict = dict()
+
+        df_same = df[df[self.sensitive_attribute]  == df[self.target_item]]
+        df_diff = df[df[self.sensitive_attribute]  != df[self.target_item]]
+        if self.test_frac is  None:
+            train_df_same_size = self.n_tasks_samples * self.n_tasks
+            train_df_diff_size = self.n_tasks_samples * self.n_tasks
+        else:
+            train_df_same_size = int(len(df_same) * (1 - self.test_frac))
+            train_df_diff_size = int(len(df_diff) * (1 - self.test_frac))
+
+        if self.n_tasks == 2:
+            train_tasks_dict["0"] = df_same.iloc[:train_df_same_size, :]
+            train_tasks_dict["1"] = df_diff.iloc[:train_df_diff_size, :]
+
+            test_tasks_dict["0"] = df_same.iloc[train_df_same_size:, :]
+            test_tasks_dict["1"] = df_diff.iloc[train_df_diff_size:, :]
+
+        else:
+            train_tasks_dict = self._same_tasks_divide(df_same.iloc[:train_df_same_size, :])
+            test_tasks_dict = self._same_tasks_divide(df_same.iloc[train_df_same_size:, :])
+
+            train_tasks_dict[f"{self.n_tasks - 1}"] = df_diff.iloc[:train_df_diff_size, :]
+            test_tasks_dict[f"{self.n_tasks - 1}"] = df_diff.iloc[train_df_diff_size:, :]
+
+        return train_tasks_dict, test_tasks_dict
+
+    def _split_data_into_tasks(self, all_data):
+        """
+        Splits the data into tasks using a specified criterion. Available criteria are 'random' and 'class'.
+        Args:
+            all_data(pd.DataFrame): The DataFrame containing the data to split.
+
+        Returns:
+            Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]: A tuple containing the training and test dictionaries.
+        """
+        if self.tasks_folder is not None:
+            os.makedirs(self.tasks_folder, exist_ok=True)
+        else:
+            raise ValueError("Tasks folder is not defined.")
+
+        if self.n_tasks_samples is not None and self.n_tasks * self.n_tasks_samples > len(all_data):
+            raise ValueError(
+                "The product between 'n_tasks' and 'n_tasks_samples' exceeds the number of available samples.")
+
+        if self.target_item is None or self.n_features is None or self.sensitive_attribute is None:
+            raise ValueError("Target item, number of features and sensitive attribute"
+                             " must be defined for binary classification tasks.")
+        if self.split_criterion == "correlation":
+            train_tasks_dict, test_tasks_dict = self._corr_tasks_split(all_data)
+        else:
+            raise NotImplementedError(f"Split criterion '{self.split_criterion}' is not implemented for binary"
+                                      f"classification tasks.")
+
+        return train_tasks_dict, test_tasks_dict
+
+    def get_task_dataset(self, task_id, mode='train'):
+        """
+        Returns an instance of the `PurchaseDataset` class for a specific task and data split type.
+        Args:
+            task_id(str): The task number or name.
+            mode(str): The type of data split, either 'train' or 'test'. Default is 'train'
+
+        Returns:
+            PurchaseDataset: An instance of the `PurchaseDataset` class.
+        """
+
+        task_id = str(task_id)
+
+        if mode not in {'train', 'test'}:
+            raise ValueError(f"Mode '{mode}' is not recognized.  Supported values are 'train' or 'test'.")
+
+        task_name = self.task_id_to_name[task_id]
+        task_cache_dir = os.path.join(self.cache_dir, 'tasks', self.split_criterion, task_name)
+        file_path = os.path.join(task_cache_dir, f'{mode}.csv')
+        task_data = pd.read_csv(file_path)
+
+        return PurchaseBinaryClassificationDataset(task_data, target=self.target_item)
+
 
 class PurchaseDataset(Dataset):
+    """
+    A class representing the Purchase dataset for multiclass classification.
+    """
     def __init__(self, dataframe, name=None):
 
         self.column_names = list(dataframe.columns.drop('class'))
@@ -339,6 +652,42 @@ class PurchaseDataset(Dataset):
 
         self.features = dataframe.drop('class', axis=1).values
         self.targets = dataframe['class'].values
+
+        self.name = name
+
+    def __len__(self):
+        """
+        Returns the number of samples in the dataset.
+
+        Returns:
+            int: The number of samples in the dataset.
+        """
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        """
+        Returns a tuple representing the idx-th sample in the dataset.
+
+        Args:
+            idx (int): Index of the sample.
+
+        Returns:
+            Tuple[torch.Tensor, torch.LongTensor]: A tuple containing input features and target value.
+        """
+        return torch.Tensor(self.features[idx]), int(self.targets[idx])
+
+class PurchaseBinaryClassificationDataset(Dataset):
+    """
+    A class representing the Purchase dataset for binary classification.
+    """
+    def __init__(self, dataframe, name=None, target='130'):
+
+        self.target = target
+        self.column_names = list(dataframe.columns.drop(self.target))
+        self.column_name_to_id = {name: i for i, name in enumerate(self.column_names)}
+
+        self.features = dataframe.drop(self.target, axis=1).values
+        self.targets = dataframe[self.target].values
 
         self.name = name
 

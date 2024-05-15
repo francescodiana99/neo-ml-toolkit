@@ -77,7 +77,7 @@ class BaseAttributeInferenceAttack(ABC):
         self.dataset = dataset
         self.device = device
         self.rng = rng if rng is not None else np.random.default_rng()
-        self.torch_rng = torch_rng if torch is not None else torch.Generator()
+        self.torch_rng = torch_rng if torch is not None else torch.Generator(device)
 
         self.sensitive_attribute_id = sensitive_attribute_id
 
@@ -145,6 +145,7 @@ class BaseAttributeInferenceAttack(ABC):
 
         return num_classes
 
+    # TODO: note that this method require both the values to be in the dataset, and this could not happen in some splits
     def _get_sensitive_attribute_interval(self):
         """
         Calculate the interval of the sensitive attribute values in the dataset.
@@ -265,7 +266,8 @@ class AttributeInferenceAttack(BaseAttributeInferenceAttack):
     def __init__(
             self, messages_metadata, dataset, sensitive_attribute_id, sensitive_attribute_type, initialization,
             device, model_init_fn, criterion, is_binary_classification, learning_rate, optimizer_name, success_metric,
-            logger, log_freq, gumbel_temperature=1.0, gumbel_threshold=0.5, rng=None, torch_rng=None
+            logger, log_freq, gumbel_temperature=1.0, gumbel_threshold=0.5, rng=None, torch_rng=None, flip_percentage=0,
+            test=False
     ):
         """
         Initialize the AttributeInferenceAttack.
@@ -289,6 +291,8 @@ class AttributeInferenceAttack(BaseAttributeInferenceAttack):
         - gumbel_threshold (float): non-negative scalar, between 0 and 1, used as a threshold in the binary case
         - rng: Random number generator for reproducibility.
         - torch_rng (torch.Generator): Random number generator for reproducibility.
+        - flip_percentage: Percentage of sensitive features to flip. Used only when "test" option is true.
+        - test: Boolean flag to indicate whether to use the true sensitive features instead of the predicted ones.
         """
         super(AttributeInferenceAttack, self).__init__(
             dataset=dataset,
@@ -302,7 +306,7 @@ class AttributeInferenceAttack(BaseAttributeInferenceAttack):
             optimizer_name=optimizer_name,
             success_metric=success_metric,
             rng=rng,
-            torch_rng=torch_rng
+            torch_rng=torch_rng,
         )
         self.messages_metadata = messages_metadata
 
@@ -326,6 +330,11 @@ class AttributeInferenceAttack(BaseAttributeInferenceAttack):
 
         self.pseudo_gradients_dict = self._compute_pseudo_gradients_dict()
 
+        # TODO: remove these two args, here just for testing purposes
+        self.flip_percentage = flip_percentage
+
+        self.test = test
+
     def _get_round_ids(self):
         """
         Retrieve the round IDs from the provided messages metadata.
@@ -347,7 +356,7 @@ class AttributeInferenceAttack(BaseAttributeInferenceAttack):
         - torch.Tensor: A tensor representing the initialized logits of the sensitive attribute with gradients enabled.
         """
         if self.initialization == "normal":
-            logits = torch.randn(size=(self.n_samples, self.num_classes), generator=self.torch_rng)
+            logits = torch.randn(size=(self.n_samples, self.num_classes), device=self.device, generator=self.torch_rng)
         else:
             raise NotImplementedError(
                 f"{self.initialization} is not a valid initialization strategy. "
@@ -438,6 +447,7 @@ class AttributeInferenceAttack(BaseAttributeInferenceAttack):
                                   map_location=torch.device(self.device))["model_state_dict"]
         model = self.model_init_fn()
         model.load_state_dict(model_chkpts)
+        model = model.to(self.device)
 
         return model
 
@@ -535,19 +545,35 @@ class AttributeInferenceAttack(BaseAttributeInferenceAttack):
         self.optimizer.zero_grad()
 
         self.sensitive_attribute = self._sample_sensitive_attribute(deterministic=False, hard=True)
+        # plug here the true value for the feature
         self.predicted_features[:, self.sensitive_attribute_id] = self.sensitive_attribute
 
-        loss = torch.tensor(0.)
+        # TODO: remove these lines ********************************
+        if self.test is True:
+            self.predicted_features[:, self.sensitive_attribute_id] = self.true_features[:, self.sensitive_attribute_id]
+            n_flip = int(self.predicted_features.shape[0] * self.flip_percentage)
+            random_idx = torch.randperm(self.predicted_features.shape[0])[:n_flip]
+            self.predicted_features[random_idx, self.sensitive_attribute_id] = \
+                torch.where(self.predicted_features[random_idx, self.sensitive_attribute_id] == \
+                            self.sensitive_attribute_interval[0],
+                            self.sensitive_attribute_interval[1],
+                            self.sensitive_attribute_interval[0])
+
+        loss = torch.tensor(0., device=self.device)
+
         for round_id in self.round_ids:
             pseudo_grad = self.pseudo_gradients_dict[round_id]
 
             global_model = self.global_models_dict[round_id]
             global_model.zero_grad()
 
+            # plug the sensitive attribute in virtual grad
             virtual_grad = self._compute_virtual_gradient(global_model=global_model)
+
 
             # TODO: move to cosine dissimilarity
             round_loss = F.cosine_similarity(virtual_grad, pseudo_grad, dim=0)
+            l2_dist = torch.cdist(virtual_grad.unsqueeze(0), pseudo_grad.unsqueeze(0), p=2).item()
 
             loss += 1 - round_loss
 
@@ -569,7 +595,7 @@ class AttributeInferenceAttack(BaseAttributeInferenceAttack):
         self.logger.add_scalar("Loss", loss, c_iteration)
         self.logger.add_scalar("Metric", metric, c_iteration)
 
-        return loss, metric
+        return loss, metric, l2_dist
 
     def execute_attack(self, num_iterations, output_losses=False):
         """
@@ -578,11 +604,13 @@ class AttributeInferenceAttack(BaseAttributeInferenceAttack):
         Parameters:
         - num_iterations (int): The number of iterations to perform the attack.
         """
-        # TODO: remove all_losses, only for debug
+        # TODO: remove all_losses and l2_dist, only for debug
         all_losses = []
+        all_l2_dist = []
         for c_iteration in tqdm(range(num_iterations), leave=False):
-            loss, metric = self._perform_iteration(c_iteration)
+            loss, metric, l2_dist = self._perform_iteration(c_iteration)
             all_losses.append(loss.item())
+            all_l2_dist.append(l2_dist)
 
             if c_iteration % self.log_freq == 0:
                 logging.info("+" * 50)
@@ -590,7 +618,7 @@ class AttributeInferenceAttack(BaseAttributeInferenceAttack):
                 logging.info("+" * 50)
 
         if output_losses:
-            return all_losses
+            return all_losses, all_l2_dist
 
     def evaluate_attack(self):
         """
@@ -630,121 +658,6 @@ class ModelDrivenAttributeInferenceAttack(BaseAttributeInferenceAttack):
 
         self.model = model
         self.model.eval()
-
-    def execute_attack_and_split_data(self, verbose=False):
-        """
-        Execute the attribute inference attack and split the data according to the attack results.
-
-        Parameters:
-        - verbose (bool): If True, activate verbose mode.
-        Returns:
-            df_dict: A dictionary containing the dataframes of the different splits.
-        """
-
-        df_dict = {}
-        recon_error_flipped_feature = []
-        recon_error_initial_feature = []
-        correct_reconstructions = []
-        wrong_reconstructions = []
-        true_data = torch.cat((self.true_features, self.true_labels), 1).cpu().numpy()
-
-        c_error_man = 0
-        c_error_woman = 0
-
-        c_correct_man = 0
-        c_correct_woman = 0
-
-        if self.sensitive_attribute_type == "binary":
-            for idx, (_, label) in enumerate(zip(self.true_features, self.true_labels)):
-                with torch.no_grad():
-
-                    clone_1 = self.true_features[idx].clone()
-                    clone_1[self.sensitive_attribute_id] = self.sensitive_attribute_interval[1]
-
-                    clone_0 = self.true_features[idx].clone()
-                    clone_0[self.sensitive_attribute_id] = self.sensitive_attribute_interval[0]
-
-                    loss_1 = self.criterion(self.model(clone_1), label)
-                    loss_0 = self.criterion(self.model(clone_0), label)
-
-                    # TODO: correct with self.sensitive_attribute_interval
-                    if loss_1 < loss_0 and self.true_features[idx, self.sensitive_attribute_id].item() < 0:
-                        c_error_man += 1
-
-                        self.predicted_features[idx, self.sensitive_attribute_id] = \
-                            self.sensitive_attribute_interval[1]
-
-                        clone_to_save_flip = self.predicted_features[idx].clone()
-                        clone_to_save_flip[self.sensitive_attribute_id] = self.sensitive_attribute_interval[1]
-
-                        clone_to_save_initial = self.predicted_features[idx].clone()
-                        clone_to_save_initial[self.sensitive_attribute_id] = self.sensitive_attribute_interval[0]
-
-                        recon_error_flipped_feature.append((torch.cat((clone_to_save_flip, label), 0).cpu().numpy()))
-                        recon_error_initial_feature.append((torch.cat((clone_to_save_initial, label),
-                                                                               0).cpu().numpy()))
-
-                    elif loss_0 <= loss_1 and self.true_features[idx, self.sensitive_attribute_id].item() > 0:
-                        c_error_woman += 1
-
-                        self.predicted_features[idx, self.sensitive_attribute_id] = \
-                            self.sensitive_attribute_interval[0]
-
-                        clone_to_save_flip = self.predicted_features[idx].clone()
-                        clone_to_save_flip[self.sensitive_attribute_id] = self.sensitive_attribute_interval[0]
-
-                        clone_to_save_initial = self.predicted_features[idx].clone()
-                        clone_to_save_initial[self.sensitive_attribute_id] = self.sensitive_attribute_interval[1]
-
-                        recon_error_flipped_feature.append((torch.cat((clone_to_save_flip, label), 0).cpu().numpy()))
-                        recon_error_initial_feature.append((torch.cat((clone_to_save_initial, label),
-                                                                               0).cpu().numpy()))
-                    else:
-                        if loss_0 <= loss_1:
-                            self.predicted_features[idx, self.sensitive_attribute_id] = \
-                            self.sensitive_attribute_interval[0]
-                            c_correct_woman += 1
-                        else:
-                            self.predicted_features[idx, self.sensitive_attribute_id] = \
-                            self.sensitive_attribute_interval[1]
-                            c_correct_man += 1
-
-                    if torch.equal(self.true_features[idx], self.predicted_features[idx]):
-                        correct_reconstructions.append((torch.cat((self.predicted_features[idx], label),
-                                                                  0).cpu().numpy()))
-                    else:
-                        wrong_reconstructions.append((torch.cat((self.true_features[idx], label),
-                                                                  0).cpu().numpy()))
-
-
-        else:
-            raise NotImplementedError(
-                "Method 'execute_attack_and_split_data' is not yet implemented for categorical and numerical variables."
-            )
-
-        if verbose:
-            logging.info(f"Number of wrong reconstructions: {c_error_woman + c_error_man}")
-            logging.info(f"Number of samples incorrectly predicted as women: {c_error_woman}")
-            logging.info(f"Number of samples incorrectly predicted as men: {c_error_man}")
-            logging.info(f" Number of correctly classified man {c_correct_man}")
-            logging.info(f" Number of correctly classified women {c_correct_woman}")
-            logging.info(f"Total number of samples: {self.n_samples}")
-
-        df_dict["recon_error_flipped_feature"] = pd.DataFrame(recon_error_flipped_feature)
-        df_dict["recon_error_initial_feature"] = pd.DataFrame(recon_error_initial_feature)
-        df_dict["correct_reconstructions"] = pd.DataFrame(correct_reconstructions)
-        df_dict["wrong_reconstructions"] = pd.DataFrame(wrong_reconstructions)
-
-        df_correct_recon_flip_feature = df_dict["correct_reconstructions"].copy()
-        df_correct_recon_flip_feature[self.sensitive_attribute_id] = (
-                1 - df_dict["correct_reconstructions"][self.sensitive_attribute_id])
-        df_dict["correct_recon_flipped_feature"] = pd.DataFrame(df_correct_recon_flip_feature)
-
-        flipped_features = true_data.copy()
-        flipped_features[:, self.sensitive_attribute_id] = 1 - true_data[:, self.sensitive_attribute_id]
-        df_dict["flipped_features"] = pd.DataFrame(flipped_features)
-
-        return df_dict
 
     def _init_sensitive_attribute(self):
         """
